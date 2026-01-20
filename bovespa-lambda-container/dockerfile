@@ -1,0 +1,16 @@
+FROM public.ecr.aws/lambda/python:3.11
+
+RUN pip install \
+    yfinance \
+    pandas==1.5.3 \
+    numpy==1.24.3 \
+    pyarrow==14.0.0 \
+    boto3==1.28.0 \
+    pytz==2024.1 \
+    requests==2.31.0
+
+# Copiar código
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}
+
+# Comando
+CMD ["lambda_function.lambda_handler"]

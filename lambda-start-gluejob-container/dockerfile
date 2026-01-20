@@ -1,0 +1,9 @@
+FROM public.ecr.aws/lambda/python:3.11
+
+RUN pip install --no-cache-dir --upgrade boto3
+
+# Copia o código da função
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}
+
+# Define o handler da Lambda
+CMD ["lambda_function.lambda_handler"]

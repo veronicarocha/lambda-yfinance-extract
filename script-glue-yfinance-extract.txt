@@ -1,0 +1,117 @@
+import sys
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from pyspark.sql.functions import col, avg, sum, count, max, min, lag, date_format, when, lit, to_date
+from pyspark.sql.window import Window
+
+# Inicialização
+glueContext = GlueContext(SparkContext.getOrCreate())
+spark = glueContext.spark_session
+
+# Caminhos
+raw_path = "s3://fiap-bovespa-id_conta/raw/"
+refined_path = "s3://fiap-bovespa-id_conta/refined/"
+
+# Ler dados
+df = spark.read.parquet(raw_path)
+
+# Normalizar nomes das colunas
+for old_col in df.columns:
+    new_col = old_col.lower().replace('(', '_').replace(')', '_').replace(',', '_')
+    new_col = new_col.replace(' ', '_').replace("'", "").replace('"', '').replace('__', '_').strip('_')
+    if old_col != new_col:
+        df = df.withColumnRenamed(old_col, new_col)
+
+# Garantir colunas necessárias
+if 'close' in df.columns:
+    df = df.withColumn('preco_fechamento', col('close').cast('double'))
+else:
+    df = df.withColumn('preco_fechamento', lit(0.0))
+
+if 'volume' in df.columns:
+    df = df.withColumn('volume_numerico', col('volume').cast('double'))
+else:
+    df = df.withColumn('volume_numerico', lit(0.0))
+
+if 'ticker' not in df.columns:
+    df = df.withColumn('ticker', lit('UNKNOWN'))
+
+# Agrupamento por ticker e date (CORREÇÃO: usar date, não data_extraida)
+agg_df = df.groupBy("ticker", "date").agg(
+    avg("volume_numerico").alias("media_volume"),
+    sum("volume_numerico").alias("soma_volume"),
+    count("*").alias("quantidade_registros"),
+    avg("preco_fechamento").alias("media_fechamento"),
+    max("preco_fechamento").alias("preco_maximo"),
+    min("preco_fechamento").alias("preco_minimo")
+)
+
+# Renomear colunas
+renamed_df = agg_df \
+    .withColumnRenamed("media_volume", "volume_medio") \
+    .withColumnRenamed("soma_volume", "volume_total") \
+    .withColumnRenamed("quantidade_registros", "n_linhas") \
+    .withColumnRenamed("media_fechamento", "preco_medio")
+
+# Cálculo de variação usando date para ordenação
+window_spec = Window.partitionBy("ticker").orderBy("date")
+final_df = renamed_df \
+    .withColumn("preco_anterior", lag("preco_medio", 1).over(window_spec)) \
+    .withColumn("variacao", 
+        when(col("preco_anterior").isNull(), 0.0)
+        .otherwise(col("preco_medio") - col("preco_anterior"))
+    ) \
+    .withColumn("variacao_percentual",
+        when(
+            (col("preco_anterior").isNull()) | (col("preco_anterior") == 0),
+            0.0
+        ).otherwise(
+            ((col("preco_medio") - col("preco_anterior")) / col("preco_anterior")) * 100
+        )
+    )
+
+# Converter date para tipo DATE (CORREÇÃO DO ERRO)
+final_df = final_df.withColumn("date", to_date(col("date")))
+
+# Criar coluna para particionamento
+final_df = final_df.withColumn(
+    "date_str",
+    date_format(col("date"), "yyyy-MM-dd")
+)
+
+# Salvar dados
+final_df.write.mode("overwrite") \
+    .partitionBy("date_str", "ticker") \
+    .parquet(refined_path)
+
+# Catalogar no Glue
+spark.sql("CREATE DATABASE IF NOT EXISTS bovespa_db")
+
+# Dropar tabela se existir
+spark.sql("DROP TABLE IF EXISTS bovespa_db.bovespa_refinado")
+
+# Criar tabela com tipos corretos
+create_table_sql = f"""
+CREATE EXTERNAL TABLE bovespa_db.bovespa_refinado (
+    date DATE,
+    volume_medio DOUBLE,
+    volume_total DOUBLE,
+    n_linhas BIGINT,
+    preco_medio DOUBLE,
+    preco_maximo DOUBLE,
+    preco_minimo DOUBLE,
+    preco_anterior DOUBLE,
+    variacao DOUBLE,
+    variacao_percentual DOUBLE
+)
+PARTITIONED BY (date_str STRING, ticker STRING)
+STORED AS PARQUET
+LOCATION '{refined_path}'
+"""
+
+spark.sql(create_table_sql)
+
+# Atualizar partições
+spark.sql("MSCK REPAIR TABLE bovespa_db.bovespa_refinado")
+
+print(" Job concluído!")
